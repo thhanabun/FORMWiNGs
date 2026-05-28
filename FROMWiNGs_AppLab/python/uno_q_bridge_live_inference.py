@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -17,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from arduino.app_utils import App, Bridge
 
 from formsense_pipeline.filters import Calibration
-from formsense_pipeline.protocol import ProtocolError, parse_imu
+from formsense_pipeline.protocol import RAW_COLUMNS, ProtocolError, parse_imu
 from formsense_pipeline.thermal import ThermalMonitor
 from formsense_pipeline.unoq_model import IMUConfig, RunningFormPredictor
 from uno_q_live_inference import DEFAULT_MODEL, UNOQInferenceSession
@@ -47,7 +49,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-metric-alerts", action="store_true")
     parser.add_argument("--worker-batch-size", type=int, default=80)
     parser.add_argument("--worker-batch-wait-s", type=float, default=0.05)
-    parser.add_argument("--max-queue", type=int, default=2000)
+    parser.add_argument("--max-queue", type=int, default=30000)
+    parser.add_argument(
+        "--ble-idle-shutdown-min",
+        type=float,
+        default=30.0,
+        help="Power off UNO Q Linux after this many continuous minutes without BLE; set 0 to disable.",
+    )
     return parser
 
 
@@ -208,8 +216,9 @@ def main() -> None:
         raise SystemExit(f"Model file not found: {args.model}")
 
     line_queue: queue.Queue[str] = queue.Queue(maxsize=args.max_queue)
-    stats = {"received": 0, "dropped_queue": 0, "invalid": 0}
+    stats = {"received": 0, "dropped_queue": 0, "invalid": 0, "ble_connected": False}
     stop = threading.Event()
+    poweroff_requested = {"enabled": False, "reason": ""}
     thermal = ThermalMonitor()
     thermal_bridge_enabled = True
 
@@ -234,6 +243,17 @@ def main() -> None:
         allow_demo_alerts=False,
         enable_metric_alerts=args.enable_metric_alerts,
     )
+    local_cache_path = args.output_dir / f"{args.session_id}_local_imu_cache.csv"
+    local_cache_handle = local_cache_path.open("w", encoding="utf-8", buffering=1)
+    local_cache_handle.write(",".join(RAW_COLUMNS) + "\n")
+
+    def request_shutdown(signum: int, _frame: object) -> None:
+        print(f"SHUTDOWN_SIGNAL signal={signum}; closing logs", flush=True)
+        stop.set()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
 
     def ingest_batch(batch: str) -> None:
         accepted = 0
@@ -241,6 +261,9 @@ def main() -> None:
             message = line.strip()
             if not message:
                 continue
+            if not stats.get("ble_connected", False):
+                local_cache_handle.write(message + "\n")
+                stats["cached_local"] = stats.get("cached_local", 0) + 1
             try:
                 line_queue.put_nowait(message)
                 stats["received"] += 1
@@ -261,6 +284,9 @@ def main() -> None:
         print(f"Model: {args.model}", flush=True)
         print(f"Saving: {session.raw_path}, {session.features_path}, {session.predictions_path}", flush=True)
         while not stop.is_set():
+            if not stats.get("ble_connected", False):
+                time.sleep(0.1)
+                continue
             try:
                 first_line = line_queue.get(timeout=0.2)
             except queue.Empty:
@@ -302,6 +328,8 @@ def main() -> None:
                     )
                     continue
                 if payload:
+                    if not stats.get("ble_connected", False):
+                        continue
                     payload.update(thermal.output(time.monotonic()))
                     payload["bridge_stats"] = dict(stats)
                     dashboard_payload = json.loads(_model_output_mcu_ble_payload(payload))
@@ -331,6 +359,48 @@ def main() -> None:
         now_s = time.monotonic()
         try:
             with BRIDGE_LOCK:
+                ble_connected = str(Bridge.call("formsense/ble_connected")).strip() == "1"
+        except Exception as error:
+            if stats.get("ble_state_errors", 0) < 5:
+                print(f"BLE_STATE_ERROR {type(error).__name__}: {error}", flush=True)
+            stats["ble_state_errors"] = stats.get("ble_state_errors", 0) + 1
+            time.sleep(0.2)
+            return
+
+        previous_ble_connected = bool(stats.get("ble_connected", False))
+        stats["ble_connected"] = ble_connected
+        if previous_ble_connected != ble_connected:
+            if ble_connected:
+                stats["ble_connects"] = stats.get("ble_connects", 0) + 1
+                stats["ble_disconnected_since_s"] = None
+                print(f"BLE_CONNECTED: processing cached queue={line_queue.qsize()}", flush=True)
+            else:
+                stats["ble_disconnects"] = stats.get("ble_disconnects", 0) + 1
+                stats["ble_disconnected_since_s"] = now_s
+                print("BLE_DISCONNECTED: caching local sensor data", flush=True)
+        elif not ble_connected and stats.get("ble_disconnected_since_s") is None:
+            stats["ble_disconnected_since_s"] = now_s
+
+        shutdown_after_s = max(0.0, float(args.ble_idle_shutdown_min) * 60.0)
+        disconnected_since = stats.get("ble_disconnected_since_s")
+        if not ble_connected and shutdown_after_s > 0.0 and disconnected_since is not None:
+            idle_s = now_s - float(disconnected_since)
+            stats["ble_idle_s"] = round(idle_s, 1)
+            if idle_s >= shutdown_after_s:
+                reason = f"no_ble_for_{args.ble_idle_shutdown_min:g}_min"
+                poweroff_requested["enabled"] = True
+                poweroff_requested["reason"] = reason
+                print(
+                    "BLE_IDLE_SHUTDOWN "
+                    f"reason={reason} cached={stats.get('cached_local', 0)} "
+                    f"queue={line_queue.qsize()}",
+                    flush=True,
+                )
+                stop.set()
+                raise SystemExit(0)
+
+        try:
+            with BRIDGE_LOCK:
                 batch = Bridge.call("formsense/pop_imu_batch")
         except Exception as error:
             if stats.get("poll_errors", 0) < 5:
@@ -358,14 +428,19 @@ def main() -> None:
                     print(f"THERMAL_POLL_ERROR {type(error).__name__}: {error}", flush=True)
         if now_s - float(stats.get("last_sensor_status_s", 0.0)) >= 1.0:
             stats["last_sensor_status_s"] = now_s
+            status = "receiving_imu" if stats["received"] else "waiting_imu"
+            if not ble_connected:
+                status = "collecting_local" if stats["received"] else "waiting_imu_local"
             result = _log_bridge_status(
-                "receiving_imu" if stats["received"] else "waiting_imu",
+                status,
                 stats,
                 extra={
                     "queue_size": line_queue.qsize(),
                     "errn": stats.get("processing_errors", 0),
                     "bs": stats.get("last_worker_batch_size", 0),
                     "th": stats.get("thermal_ok", 0),
+                    "cache": stats.get("cached_local", 0),
+                    "idle_s": stats.get("ble_idle_s", 0),
                 },
             )
             print(f"BRIDGE_SENSOR_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
@@ -380,7 +455,20 @@ def main() -> None:
         App.run(user_loop=poll_mcu_imu)
     finally:
         stop.set()
+        thread.join(timeout=1.0)
+        local_cache_handle.close()
         session.close()
+        print(
+            f"Logs closed: {session.raw_path}, {session.features_path}, "
+            f"{session.predictions_path}, {local_cache_path}",
+            flush=True,
+        )
+        if poweroff_requested["enabled"]:
+            print(f"POWER_OFF_REQUEST reason={poweroff_requested['reason']} command=sudo halt", flush=True)
+            try:
+                subprocess.run(["sudo", "halt"], check=False, timeout=15)
+            except Exception as error:
+                print(f"POWER_OFF_ERROR {type(error).__name__}: {error}", flush=True)
 
 
 if __name__ == "__main__":

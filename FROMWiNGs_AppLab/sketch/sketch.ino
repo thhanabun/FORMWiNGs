@@ -54,6 +54,8 @@ uint8_t bridgeQueueCount = 0;
 
 volatile bool hasPendingBle = false;
 bool pendingBleChunkOk = true;
+bool bleClientConnected = false;
+bool lastBleClientConnected = false;
 uint32_t uartPackets = 0;
 uint32_t bridgeBatches = 0;
 uint32_t bridgePopCalls = 0;
@@ -73,6 +75,34 @@ bool thermalPending = false;
 bool hasThermalLine = false;
 TwoWire *thermalWire = &Wire1;
 const char *thermalWireName = "Wire1";
+
+void clearRuntimeQueues() {
+  while (Serial1.available() > 0) {
+    Serial1.read();
+  }
+  rxIndex = 0;
+  batchIndex = 0;
+  bridgeBatch[0] = '\0';
+  bridgeQueueHead = 0;
+  bridgeQueueTail = 0;
+  bridgeQueueCount = 0;
+  pendingBle[0] = '\0';
+  pendingBleIndex = 0;
+  pendingBleChunkOk = true;
+  hasPendingBle = false;
+  lastPacketMs = millis();
+}
+
+void clearPendingBlePayload() {
+  pendingBle[0] = '\0';
+  pendingBleIndex = 0;
+  pendingBleChunkOk = true;
+  hasPendingBle = false;
+}
+
+String bleConnectedPayload() {
+  return bleClientConnected ? "1" : "0";
+}
 
 bool beginBlePayload(String payload) {
   (void)payload;
@@ -304,8 +334,7 @@ void serviceThermal() {
 }
 
 void serviceBle() {
-  BLE.poll();
-  if (!hasPendingBle) {
+  if (!bleClientConnected || !hasPendingBle) {
     return;
   }
 
@@ -314,6 +343,23 @@ void serviceBle() {
   hasPendingBle = false;
   formSenseCharacteristic.writeValue(latestBle);
   bleUpdates++;
+}
+
+void serviceBleConnection() {
+  BLE.poll();
+  bleClientConnected = BLE.connected();
+  if (bleClientConnected == lastBleClientConnected) {
+    return;
+  }
+
+  lastBleClientConnected = bleClientConnected;
+  if (bleClientConnected) {
+    lastThermalRequestMs = millis() - THERMAL_INTERVAL_MS;
+    Monitor.println("BLE client connected; model/BLE output active");
+  } else {
+    clearPendingBlePayload();
+    Monitor.println("BLE client disconnected; collecting local sensor data");
+  }
 }
 
 void printStatus() {
@@ -334,6 +380,8 @@ void printStatus() {
   Monitor.print(bridgePopHits);
   Monitor.print(" bridge_q=");
   Monitor.print(bridgeQueueCount);
+  Monitor.print(" ble_connected=");
+  Monitor.print(bleClientConnected ? 1 : 0);
   Monitor.print(" thermal_reads=");
   Monitor.print(thermalReads);
   Monitor.print(" thermal_errors=");
@@ -361,7 +409,7 @@ void printStatus() {
     Monitor.println(" latest_model=<waiting_for_model_output>");
   }
 
-  if (millis() - lastPacketMs > 3000) {
+  if (bleClientConnected && millis() - lastPacketMs > 3000) {
     Monitor.println("WARN: no UART packet from Nano for 3s");
   }
 }
@@ -394,6 +442,7 @@ void setup() {
   Bridge.provide_safe("formsense/ble_begin", beginBlePayload);
   Bridge.provide_safe("formsense/ble_chunk", receiveBleChunk);
   Bridge.provide_safe("formsense/ble_commit", commitBlePayload);
+  Bridge.provide_safe("formsense/ble_connected", bleConnectedPayload);
   Bridge.provide_safe("formsense/pop_imu_batch", popBridgeBatch);
   Bridge.provide_safe("formsense/pop_thermal", popThermalPayload);
 
@@ -409,6 +458,7 @@ void setup() {
 }
 
 void loop() {
+  serviceBleConnection();
   readUart();
   serviceBridgeFlush();
   serviceThermal();

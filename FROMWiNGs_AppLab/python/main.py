@@ -108,6 +108,8 @@ if __name__ == "__main__":
         "80",
         "--worker-batch-wait-s",
         "0.05",
+        "--ble-idle-shutdown-min",
+        "30",
         "--output-dir",
         str(Path.home() / "formsense_data" / "live"),
     ]
