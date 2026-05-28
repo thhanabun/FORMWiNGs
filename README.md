@@ -11,7 +11,7 @@ Nano 33 BLE Sense
 UNO Q MCU sketch
   -> RouterBridge batches
 UNO Q Linux Python app
-  -> feature extraction + TFLite model
+  -> feature extraction + XGBoost model
 UNO Q MCU sketch
   -> BLE notify as FROMWiNGs
 ```
@@ -21,6 +21,7 @@ UNO Q MCU sketch
 ```text
 Nano TX / D1 -> UNO Q RX / D0
 Nano GND     -> UNO Q GND
+Modulino Thermo -> UNO Q I2C connector
 ```
 
 ## Program Boards
@@ -58,22 +59,30 @@ The batch files only program board firmware.
 - Nano sends filtered CSV at 50 Hz over `Serial1` / UART.
 - UNO Q sketch receives Nano UART, batches IMU lines, and exposes
   `formsense/pop_imu_batch` to Python.
-- Python polls RouterBridge, parses IMU lines, runs feature extraction and model
-  inference, and logs `FULL_PAYLOAD_JSON`.
+- Python polls RouterBridge, parses IMU lines, runs feature extraction and
+  XGBoost inference, and sends prediction payloads to the UNO Q MCU BLE bridge.
 - Feature extraction now resamples dropped/sparse packets back to a uniform 50 Hz
   timeline.
 - A fallback feature window emits predictions even when step detection is not
   confident yet.
-- BLE payloads are chunked with `ble_begin`, `ble_chunk`, and `ble_commit` so
-  large prediction JSON can pass through RouterBridge safely.
+- BLE payloads are chunked with `ble_begin`, `ble_chunk`, and `ble_commit`.
+  The payload includes SHAP-style XGBoost feature contributions and uses an
+  1800-byte MCU BLE buffer.
+- UNO Q now polls a Modulino Thermo on I2C address `0x44`, exposes
+  `formsense/pop_thermal`, and Python adds `environment` plus thermal
+  `recommendation` to prediction payloads.
+- Runtime buffering is tuned for 50 Hz input: MCU bridge queue is larger, bridge
+  batches flush less often, and Python polls less aggressively.
 
 ## Healthy Logs
 
 You should see:
 
 ```text
-FULL_PAYLOAD_JSON={...}
+PREDICTION_SUMMARY=window_id=... class=... processed=...
 "mcu_ble":{"status":"SENT_TO_MCU","bytes":...,"chunks":...}
+"environment":{"status":"ok","temperature_c":...,"humidity_pct":...}
+"recommendation":{"severity":"...","code":"..."}
 ```
 
 This means the full route is working:

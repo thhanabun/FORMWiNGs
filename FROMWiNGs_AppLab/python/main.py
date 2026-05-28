@@ -30,6 +30,13 @@ def _first_existing_file(candidates: list[Path]) -> Path:
     raise FileNotFoundError(f"Cannot find model file. Checked:\n{checked}")
 
 
+def _optional_existing_file(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 PYTHON_DIR = _first_existing_directory(
     [
         SCRIPT_DIR,
@@ -54,6 +61,14 @@ if __name__ == "__main__":
         str(
             _first_existing_file(
                 [
+                    APP_ROOT / "running_form_xgboost.json",
+                    APP_ROOT / "model" / "running_form_xgboost.json",
+                    SCRIPT_DIR / "running_form_xgboost.json",
+                    SCRIPT_DIR / "model" / "running_form_xgboost.json",
+                    SCRIPT_DIR.parent / "running_form_xgboost.json",
+                    SCRIPT_DIR.parent / "model" / "running_form_xgboost.json",
+                    WORKING_DIR / "running_form_xgboost.json",
+                    WORKING_DIR / "model" / "running_form_xgboost.json",
                     APP_ROOT / "running_form_transformer_fp16.tflite",
                     APP_ROOT / "model" / "running_form_transformer_fp16.tflite",
                     SCRIPT_DIR / "running_form_transformer_fp16.tflite",
@@ -65,6 +80,27 @@ if __name__ == "__main__":
                 ]
             )
         ),
+        *(
+            [
+                "--normalizer",
+                str(normalizer),
+            ]
+            if (
+                normalizer := _optional_existing_file(
+                    [
+                        APP_ROOT / "running_form_normalizer.json",
+                        APP_ROOT / "model" / "running_form_normalizer.json",
+                        SCRIPT_DIR / "running_form_normalizer.json",
+                        SCRIPT_DIR / "model" / "running_form_normalizer.json",
+                        SCRIPT_DIR.parent / "running_form_normalizer.json",
+                        SCRIPT_DIR.parent / "model" / "running_form_normalizer.json",
+                        WORKING_DIR / "running_form_normalizer.json",
+                        WORKING_DIR / "model" / "running_form_normalizer.json",
+                    ]
+                )
+            )
+            else []
+        ),
         "--enable-metric-alerts",
         "--sample-rate-hz",
         "50",
@@ -72,7 +108,6 @@ if __name__ == "__main__":
         "80",
         "--worker-batch-wait-s",
         "0.05",
-        "--mcu-ble",
         "--output-dir",
         str(Path.home() / "formsense_data" / "live"),
     ]

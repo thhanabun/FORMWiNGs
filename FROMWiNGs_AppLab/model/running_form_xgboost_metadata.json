@@ -1,0 +1,50 @@
+{
+  "model_type": "xgboost",
+  "model_file": "artifacts\\running_form_xgboost.json",
+  "normalizer_json": "artifacts\\running_form_normalizer.json",
+  "feature_columns": [
+    "cadence_spm",
+    "vertical_oscillation_cm",
+    "gct_flight_balance_ms",
+    "impact_loading_rate_bw_s",
+    "trunk_forward_lean_deg",
+    "left_right_asymmetry_pct",
+    "heel_strike_likelihood"
+  ],
+  "class_names": [
+    "Good",
+    "Bad Form"
+  ],
+  "xgboost_config": {
+    "n_estimators": 100,
+    "learning_rate": 0.05,
+    "max_depth": 2,
+    "min_child_weight": 2.0,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_lambda": 2.0,
+    "reg_alpha": 0.0,
+    "random_state": 42,
+    "n_jobs": 0,
+    "device": "cpu"
+  },
+  "training_config": {
+    "epochs": 100,
+    "batch_size": 64,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.001,
+    "val_fraction": 0.2,
+    "entropy_weight": 0.5,
+    "seed": 42,
+    "num_workers": 0
+  },
+  "final_metrics": {
+    "split": "stratified_window",
+    "train_accuracy": 1.0,
+    "train_loss": 0.0773001556589562,
+    "val_accuracy": 1.0,
+    "val_loss": 0.0710733852841968
+  },
+  "input_note": "Input must be normalized with running_form_normalizer.json before inference.",
+  "primary_output": "probabilities [Good, Bad Form]"
+}

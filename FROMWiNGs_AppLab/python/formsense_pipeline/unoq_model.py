@@ -119,6 +119,17 @@ def _clamp(value: float, low: float, high: float) -> float:
     return float(np.clip(float(value), low, high))
 
 
+def _softmax(values: np.ndarray) -> np.ndarray:
+    shifted = values - float(np.max(values))
+    exp_values = np.exp(shifted)
+    return exp_values / max(float(np.sum(exp_values)), 1e-12)
+
+
+def _logit(probability: float) -> float:
+    value = float(np.clip(probability, 1e-8, 1.0 - 1e-8))
+    return math.log(value / (1.0 - value))
+
+
 class BiomechanicsExtractor:
     """Batch extraction matched to the supplied sacrum-mounted model pipeline."""
 
@@ -395,26 +406,69 @@ def _load_interpreter_class():
             ) from error
 
 
+class _JsonXGBoostBinaryClassifier:
+    """Small XGBoost JSON evaluator for binary:logistic tree ensembles."""
+
+    def __init__(self, model_path: Path):
+        model = json.loads(model_path.read_text(encoding="utf-8"))
+        learner = model["learner"]
+        self.trees = learner["gradient_booster"]["model"]["trees"]
+        parameters = learner.get("learner_model_param", {})
+        raw_base_score = str(parameters.get("base_score", "0.5")).strip("[]")
+        self.base_margin = _logit(float(raw_base_score))
+
+    @staticmethod
+    def _node_value(tree: Mapping[str, object], node: int) -> float:
+        return float(tree["base_weights"][node])  # type: ignore[index]
+
+    def _tree_margin_and_contributions(self, tree: Mapping[str, object], values: np.ndarray) -> tuple[float, np.ndarray]:
+        left = tree["left_children"]  # type: ignore[index]
+        right = tree["right_children"]  # type: ignore[index]
+        split_indices = tree["split_indices"]  # type: ignore[index]
+        split_conditions = tree["split_conditions"]  # type: ignore[index]
+        default_left = tree.get("default_left", [])  # type: ignore[assignment]
+        contributions = np.zeros(values.shape[0], dtype=np.float64)
+        node = 0
+
+        while int(left[node]) != -1 or int(right[node]) != -1:
+            feature_index = int(split_indices[node])
+            threshold = float(split_conditions[node])
+            feature_value = values[feature_index]
+            if not np.isfinite(feature_value):
+                go_left = bool(default_left[node]) if node < len(default_left) else True
+            else:
+                go_left = bool(feature_value < threshold)
+            child = int(left[node] if go_left else right[node])
+            contributions[feature_index] += self._node_value(tree, child) - self._node_value(tree, node)
+            node = child
+
+        return self._node_value(tree, node), contributions
+
+    def predict(self, values: np.ndarray) -> tuple[float, np.ndarray]:
+        margin = self.base_margin
+        contributions = np.zeros(values.shape[0], dtype=np.float64)
+        for tree in self.trees:
+            tree_margin, tree_contributions = self._tree_margin_and_contributions(tree, values)
+            margin += tree_margin
+            contributions += tree_contributions
+        probability_bad = _sigmoid(margin)
+        return probability_bad, contributions
+
+
 class RunningFormPredictor:
-    """Runs the deployed FP16 TFLite model and exposes its attention output."""
+    """Runs a deployed TFLite or XGBoost model and exposes feature contributions."""
 
     def __init__(self, model_path: Path, normalizer_path: Path | None = None):
-        if model_path.suffix.lower() != ".tflite":
-            raise ValueError(f"UNO Q runtime expects a .tflite model, received: {model_path}")
-        Interpreter = _load_interpreter_class()
-        self.interpreter = Interpreter(model_path=str(model_path))
-        self.interpreter.allocate_tensors()
-        signatures = self.interpreter.get_signature_list()
-        if "serving_default" not in signatures:
-            raise ValueError("TFLite model is missing serving_default signature")
-        signature = signatures["serving_default"]
-        expected_outputs = {"feature_attention", "probabilities"}
-        if "features" not in signature["inputs"] or not expected_outputs.issubset(signature["outputs"]):
-            raise ValueError("TFLite model must expose features input and feature_attention/probabilities outputs")
-        self.runner = self.interpreter.get_signature_runner("serving_default")
+        self.model_path = model_path
+        self.model_kind = model_path.suffix.lower().lstrip(".")
         self.feature_columns = list(FEATURE_KEYS)
         self.class_names = ["Good", "Bad Form"]
         self.normalizer: Mapping[str, object] | None = None
+        metadata_path = model_path.with_name(f"{model_path.stem}_metadata.json")
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.feature_columns = list(metadata.get("feature_columns", self.feature_columns))
+            self.class_names = list(metadata.get("class_names", self.class_names))
         if normalizer_path is not None and not normalizer_path.exists():
             raise FileNotFoundError(f"normalizer file not found: {normalizer_path}")
         if normalizer_path is not None:
@@ -422,30 +476,70 @@ class RunningFormPredictor:
             normalized_columns = self.normalizer.get("feature_columns", self.feature_columns)
             if list(normalized_columns) != list(self.feature_columns):
                 raise ValueError("normalizer feature_columns do not match model feature_columns")
+        if self.model_kind == "tflite":
+            Interpreter = _load_interpreter_class()
+            self.interpreter = Interpreter(model_path=str(model_path))
+            self.interpreter.allocate_tensors()
+            signatures = self.interpreter.get_signature_list()
+            if "serving_default" not in signatures:
+                raise ValueError("TFLite model is missing serving_default signature")
+            signature = signatures["serving_default"]
+            expected_outputs = {"feature_attention", "probabilities"}
+            if "features" not in signature["inputs"] or not expected_outputs.issubset(signature["outputs"]):
+                raise ValueError("TFLite model must expose features input and feature_attention/probabilities outputs")
+            self.runner = self.interpreter.get_signature_runner("serving_default")
+            return
+        if self.model_kind == "json":
+            self.xgboost_model = _JsonXGBoostBinaryClassifier(model_path)
+            return
+        raise ValueError(f"Unsupported model type: {model_path}")
 
     @property
     def production_ready(self) -> bool:
         return self.normalizer is not None
 
     def predict(self, features: Mapping[str, float]) -> dict[str, object]:
-        values = np.asarray([[features[key] for key in self.feature_columns]], dtype=np.float32)
+        raw_values = np.asarray([features[key] for key in self.feature_columns], dtype=np.float32)
+        values = raw_values.reshape(1, -1)
         if self.normalizer is not None:
             mean = np.asarray(self.normalizer["mean"], dtype=np.float32)
             std = np.maximum(np.asarray(self.normalizer["std"], dtype=np.float32), 1e-6)
             values = (values - mean) / std
-        outputs = self.runner(features=values)
-        probabilities = np.asarray(outputs["probabilities"], dtype=np.float32)[0]
-        weights = np.asarray(outputs["feature_attention"], dtype=np.float32)[0]
-        weights = weights / max(float(np.sum(weights)), 1e-8)
+
+        if self.model_kind == "json":
+            probability_bad, contributions = self.xgboost_model.predict(values[0].astype(np.float64))
+            probabilities = np.asarray([1.0 - probability_bad, probability_bad], dtype=np.float32)
+            abs_contributions = np.abs(contributions)
+            if float(np.sum(abs_contributions)) > 1e-8:
+                weights = abs_contributions / float(np.sum(abs_contributions))
+            else:
+                weights = np.full(len(self.feature_columns), 1.0 / len(self.feature_columns), dtype=np.float64)
+            contribution_map = {
+                key: round(float(value), 6) for key, value in zip(self.feature_columns, contributions)
+            }
+            normalization_status = "LOADED" if self.production_ready else "MISSING_XGBOOST_NORMALIZER"
+        else:
+            outputs = self.runner(features=values)
+            probabilities = np.asarray(outputs["probabilities"], dtype=np.float32)[0]
+            weights = np.asarray(outputs["feature_attention"], dtype=np.float32)[0]
+            weights = weights / max(float(np.sum(weights)), 1e-8)
+            contribution_map = {
+                key: round(float(value), 6)
+                for key, value in zip(self.feature_columns, np.log(np.maximum(probabilities, 1e-8))[int(np.argmax(probabilities))] * weights)
+            }
+            normalization_status = "LOADED" if self.production_ready else "MISSING_TRAINING_NORMALIZER"
+
         dominant = self.feature_columns[int(np.argmax(weights))]
         predicted_index = int(np.argmax(probabilities))
         return {
             "class": self.class_names[predicted_index],
             "probabilities": {name: round(float(probabilities[index]), 6) for index, name in enumerate(self.class_names)},
             "attention_weights": {key: round(float(value), 6) for key, value in zip(self.feature_columns, weights)},
+            "feature_contributions": contribution_map,
             "dominant_feature": dominant,
             "dominant_feature_display": FEATURE_DISPLAY_NAMES.get(dominant, dominant),
             "coaching_cue": COACHING_CUES[dominant],
             "production_ready": self.production_ready,
-            "normalization_status": "LOADED" if self.production_ready else "MISSING_TRAINING_NORMALIZER",
+            "model_type": "xgboost" if self.model_kind == "json" else "tflite",
+            "normalization_status": normalization_status,
         }

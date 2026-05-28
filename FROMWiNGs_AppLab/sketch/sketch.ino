@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoBLE.h>
 #include <Arduino_RouterBridge.h>
+#include <Wire.h>
 
 /*
   Full FormSense bridge:
@@ -13,16 +14,19 @@
     seq,timestamp_s,acc_x_g,acc_y_g,acc_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps
 
   Linux side:
-    python/uno_q_bridge_live_inference.py --mcu-ble
+    python/uno_q_bridge_live_inference.py
 */
 
 const uint32_t UART_BAUD_RATE = 115200;
 const uint32_t STATUS_INTERVAL_MS = 1000;
-const uint32_t BRIDGE_FLUSH_INTERVAL_MS = 80;
+const uint32_t BRIDGE_FLUSH_INTERVAL_MS = 120;
+const uint32_t THERMAL_INTERVAL_MS = 2000;
+const uint32_t THERMAL_CONVERSION_MS = 40;
+const uint8_t THERMAL_I2C_ADDRESS = 0x44;
 const size_t RX_BUFFER_SIZE = 128;
 const size_t BRIDGE_BATCH_SIZE = 512;
-const size_t BRIDGE_QUEUE_SIZE = 8;
-const size_t BLE_VALUE_SIZE = 1200;
+const size_t BRIDGE_QUEUE_SIZE = 32;
+const size_t BLE_VALUE_SIZE = 1800;
 
 const char *SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214";
 const char *CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214";
@@ -38,6 +42,7 @@ char rxBuffer[RX_BUFFER_SIZE];
 char bridgeBatch[BRIDGE_BATCH_SIZE];
 char pendingBridgeBatches[BRIDGE_QUEUE_SIZE][BRIDGE_BATCH_SIZE];
 char latestSensorLine[RX_BUFFER_SIZE] = "";
+char latestThermalLine[64] = "";
 char pendingBle[BLE_VALUE_SIZE] = "";
 char latestBle[BLE_VALUE_SIZE] = "";
 size_t rxIndex = 0;
@@ -60,16 +65,14 @@ uint32_t lastBleUpdates = 0;
 uint32_t lastPacketMs = 0;
 uint32_t lastFlushMs = 0;
 uint32_t lastStatusMs = 0;
-
-bool receiveBlePayload(String payload) {
-  payload.trim();
-  if (payload.length() == 0) {
-    return false;
-  }
-  payload.toCharArray(pendingBle, BLE_VALUE_SIZE);
-  hasPendingBle = true;
-  return true;
-}
+uint32_t lastThermalRequestMs = 0;
+uint32_t thermalReadyMs = 0;
+uint32_t thermalReads = 0;
+uint32_t thermalErrors = 0;
+bool thermalPending = false;
+bool hasThermalLine = false;
+TwoWire *thermalWire = &Wire1;
+const char *thermalWireName = "Wire1";
 
 bool beginBlePayload(String payload) {
   (void)payload;
@@ -106,6 +109,13 @@ bool commitBlePayload(String payload) {
   }
   hasPendingBle = true;
   return true;
+}
+
+String popThermalPayload() {
+  if (!hasThermalLine) {
+    return "";
+  }
+  return String(latestThermalLine);
 }
 
 String popBridgeBatch() {
@@ -223,6 +233,76 @@ void serviceBridgeFlush() {
   }
 }
 
+bool i2cAddressResponds(TwoWire &bus, uint8_t address) {
+  bus.beginTransmission(address);
+  return bus.endTransmission() == 0;
+}
+
+void selectThermalBus() {
+  if (i2cAddressResponds(Wire1, THERMAL_I2C_ADDRESS)) {
+    thermalWire = &Wire1;
+    thermalWireName = "Wire1";
+  } else if (i2cAddressResponds(Wire, THERMAL_I2C_ADDRESS)) {
+    thermalWire = &Wire;
+    thermalWireName = "Wire";
+  }
+
+  Monitor.print("Thermal bus selected: ");
+  Monitor.print(thermalWireName);
+  Monitor.print(" address=0x");
+  Monitor.println(THERMAL_I2C_ADDRESS, HEX);
+}
+
+void serviceThermal() {
+  const uint32_t now = millis();
+
+  if (!thermalPending && now - lastThermalRequestMs >= THERMAL_INTERVAL_MS) {
+    thermalWire->beginTransmission(THERMAL_I2C_ADDRESS);
+    const uint8_t result = thermalWire->endTransmission();
+    lastThermalRequestMs = now;
+    if (result == 0) {
+      thermalPending = true;
+      thermalReadyMs = now + THERMAL_CONVERSION_MS;
+    } else {
+      thermalErrors++;
+    }
+  }
+
+  if (!thermalPending || static_cast<int32_t>(now - thermalReadyMs) < 0) {
+    return;
+  }
+
+  thermalPending = false;
+  const int count = thermalWire->requestFrom(static_cast<int>(THERMAL_I2C_ADDRESS), 4);
+  if (count != 4) {
+    thermalErrors++;
+    while (thermalWire->available() > 0) {
+      thermalWire->read();
+    }
+    return;
+  }
+
+  const uint8_t data0 = static_cast<uint8_t>(thermalWire->read());
+  const uint8_t data1 = static_cast<uint8_t>(thermalWire->read());
+  const uint8_t data2 = static_cast<uint8_t>(thermalWire->read());
+  const uint8_t data3 = static_cast<uint8_t>(thermalWire->read());
+  const uint8_t status = data0 >> 6;
+  if (status == 3) {
+    thermalErrors++;
+    return;
+  }
+
+  const uint16_t rawHumidity = (static_cast<uint16_t>(data0 & 0x3F) << 8) | data1;
+  const uint16_t rawTemperature = (static_cast<uint16_t>(data2) << 6) | (data3 >> 2);
+  const float humidityPct = (static_cast<float>(rawHumidity) * 100.0f) / 16383.0f;
+  const float temperatureC = (static_cast<float>(rawTemperature) * 165.0f) / 16383.0f - 40.0f;
+
+  snprintf(latestThermalLine, sizeof(latestThermalLine), "%lu,%.2f,%.2f",
+           static_cast<unsigned long>(now), temperatureC, humidityPct);
+  hasThermalLine = true;
+  thermalReads++;
+}
+
 void serviceBle() {
   BLE.poll();
   if (!hasPendingBle) {
@@ -254,6 +334,10 @@ void printStatus() {
   Monitor.print(bridgePopHits);
   Monitor.print(" bridge_q=");
   Monitor.print(bridgeQueueCount);
+  Monitor.print(" thermal_reads=");
+  Monitor.print(thermalReads);
+  Monitor.print(" thermal_errors=");
+  Monitor.print(thermalErrors);
   Monitor.print(" ble_updates=");
   Monitor.print(bleUpdates);
   Monitor.print(" ble_hz=");
@@ -266,9 +350,13 @@ void printStatus() {
     Monitor.print(" latest_sensor=");
     Monitor.print(latestSensorLine);
   }
+  if (latestThermalLine[0] != '\0') {
+    Monitor.print(" latest_thermal=");
+    Monitor.print(latestThermalLine);
+  }
   if (latestBle[0] != '\0') {
-    Monitor.print(" latest_model=");
-    Monitor.println(latestBle);
+    Monitor.print(" latest_model_bytes=");
+    Monitor.println(strlen(latestBle));
   } else {
     Monitor.println(" latest_model=<waiting_for_model_output>");
   }
@@ -280,6 +368,8 @@ void printStatus() {
 
 void setup() {
   Serial1.begin(UART_BAUD_RATE);
+  Wire.begin();
+  Wire1.begin();
 
   Bridge.begin();
   Monitor.begin(115200);
@@ -301,23 +391,27 @@ void setup() {
   BLE.addService(formSenseService);
   BLE.advertise();
 
-  Bridge.provide_safe("formsense/ble_notify", receiveBlePayload);
   Bridge.provide_safe("formsense/ble_begin", beginBlePayload);
   Bridge.provide_safe("formsense/ble_chunk", receiveBleChunk);
   Bridge.provide_safe("formsense/ble_commit", commitBlePayload);
   Bridge.provide_safe("formsense/pop_imu_batch", popBridgeBatch);
+  Bridge.provide_safe("formsense/pop_thermal", popThermalPayload);
 
   lastPacketMs = millis();
   lastFlushMs = millis();
+  lastThermalRequestMs = millis() - THERMAL_INTERVAL_MS;
   Monitor.println("UNO Q UART -> Linux model -> MCU BLE bridge ready");
   Monitor.print("UART baud: ");
   Monitor.println(UART_BAUD_RATE);
   Monitor.println("BLE name: FROMWiNGs");
+  Monitor.println("Thermal I2C: Modulino Thermo HS300x on address 0x44");
+  selectThermalBus();
 }
 
 void loop() {
   readUart();
   serviceBridgeFlush();
+  serviceThermal();
   serviceBle();
   printStatus();
   delay(0);

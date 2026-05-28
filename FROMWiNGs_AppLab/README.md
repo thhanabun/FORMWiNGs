@@ -12,15 +12,16 @@ Wiring:
 ```text
 Nano TX/D1 -> UNO Q RX/D0
 Nano GND   -> UNO Q GND
+Modulino Thermo -> UNO Q I2C connector
 ```
 
 App Lab files:
 
 ```text
 sketch/sketch.ino  MCU bridge + BLE advertiser
-python/main.py     Linux entrypoint, runs model with --mcu-ble
+python/main.py     Linux entrypoint, runs XGBoost model + thermal context
 python/            Model pipeline code
-model/             TFLite model
+model/             XGBoost model, metadata, normalizer, and TFLite fallback
 libraries/         Arduino sketch libraries required by App Lab compile
 ```
 
@@ -30,6 +31,7 @@ BLE:
 Name: FROMWiNGs
 Service: 19B10000-E8F2-537E-4F6C-D104768A1214
 Characteristic: 19B10001-E8F2-537E-4F6C-D104768A1214
+Properties: Read, Notify
 ```
 
 Nano still needs to be programmed once from this workspace. This package uses

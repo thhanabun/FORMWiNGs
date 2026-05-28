@@ -14,13 +14,12 @@ from typing import Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from formsense_pipeline.bluetooth_delivery import BluetoothAlertDelivery
 from formsense_pipeline.filters import Calibration
 from formsense_pipeline.metric_triggers import MetricTriggerEngine
 from formsense_pipeline.protocol import FEATURE_KEYS, RAW_COLUMNS, ImuSample, ProtocolError, encode_alert, parse_imu
 from formsense_pipeline.unoq_model import BiomechanicsExtractor, IMUConfig, RunningFormPredictor
 
-DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "model" / "running_form_transformer_fp16.tflite"
+DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "model" / "running_form_xgboost.json"
 
 
 def _csv_samples(path: Path) -> Iterator[ImuSample]:
@@ -69,7 +68,6 @@ class UNOQInferenceSession:
         cooldown_s: float,
         allow_demo_alerts: bool,
         enable_metric_alerts: bool,
-        delivery: BluetoothAlertDelivery,
     ):
         output_dir.mkdir(parents=True, exist_ok=True)
         self.raw_path = output_dir / f"{session_id}_unoq_raw.csv"
@@ -85,7 +83,6 @@ class UNOQInferenceSession:
         self.allow_demo_alerts = allow_demo_alerts
         self.enable_metric_alerts = enable_metric_alerts
         self.trigger_engine = MetricTriggerEngine()
-        self.delivery = delivery
         self.samples: deque[ImuSample] = deque()
         self.window_id = 0
         self.next_emit_s: float | None = None
@@ -204,8 +201,6 @@ class UNOQInferenceSession:
             if (model_alerts_enabled or self.enable_metric_alerts)
             else "MISSING_TRAINING_NORMALIZER_AND_METRIC_ALERTS_DISABLED",
         }
-        if alert is not None:
-            payload["feedback"]["bluetooth_delivery"] = self.delivery.deliver_prediction(payload)
         self.predictions_handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
         return payload, alert
 
@@ -240,13 +235,10 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow WARN/ALERT priority metric triggers to send @ALERT without model normalization.",
     )
-    parser.add_argument("--ble-address", help="BLE target device address/identifier that exposes a writable alert characteristic.")
-    parser.add_argument("--ble-characteristic", help="Writable BLE GATT characteristic UUID for compact alert JSON.")
-    parser.add_argument("--ble-scan-timeout-s", type=float, default=3.0)
     parser.add_argument(
         "--uart-feedback",
         action="store_true",
-        help="Also send @ALERT back through the Nano serial cable; Bluetooth/local-outbox remains primary.",
+        help="Also send @ALERT back through the Nano serial cable.",
     )
     return parser
 
@@ -261,20 +253,6 @@ def main() -> None:
         print("Model-driven alerts are disabled unless --allow-demo-alerts is explicitly passed.")
         if args.enable_metric_alerts:
             print("Rule-based metric alerts are explicitly enabled; validate thresholds before runner use.")
-    delivery = BluetoothAlertDelivery(
-        output_dir=args.output_dir,
-        session_id=args.session_id,
-        address=args.ble_address,
-        characteristic=args.ble_characteristic,
-        scan_timeout_s=args.ble_scan_timeout_s,
-    )
-    if args.ble_address or args.ble_characteristic:
-        if not delivery.configured:
-            raise SystemExit("Both --ble-address and --ble-characteristic are required for BLE delivery.")
-        retry = delivery.retry_pending()
-        print(f"BLE delivery configured; retried={retry['sent']} pending={retry['remaining']}")
-    else:
-        print("BLE not configured; generated alerts will be stored in the local outbox.")
     session = UNOQInferenceSession(
         output_dir=args.output_dir,
         session_id=args.session_id,
@@ -286,7 +264,6 @@ def main() -> None:
         cooldown_s=args.cooldown_s,
         allow_demo_alerts=args.allow_demo_alerts,
         enable_metric_alerts=args.enable_metric_alerts,
-        delivery=delivery,
     )
     print(f"Model: {args.model}")
     print(f"Saving: {session.raw_path}, {session.features_path}, {session.predictions_path}")

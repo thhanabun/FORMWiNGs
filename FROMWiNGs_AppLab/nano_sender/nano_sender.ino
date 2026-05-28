@@ -10,18 +10,21 @@
   Output on Serial1:
     seq,timestamp_s,acc_x_g,acc_y_g,acc_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps
 
-  USB Serial is kept for human-readable status only.
+  Note:
+    gyro_z_dps is smoothed and posture-filtered.
+    Slow turning trend is removed from gyro_z_dps.
 */
 
 constexpr unsigned long USB_BAUD_RATE = 115200;
 constexpr unsigned long UART_BAUD_RATE = 115200;
 constexpr unsigned long PERIOD_US = 20000;  // 50 Hz
 constexpr float FILTER_CUTOFF_HZ = 35.0f;
+constexpr float POSTURE_ALPHA = 0.98f;
 
 uint32_t sequenceNumber = 0;
 uint32_t lastSampleUs = 0;
-uint32_t lastStatusMs = 0;
 bool filterReady = false;
+bool postureFilterReady = false;
 bool haveAccSample = false;
 bool haveGyroSample = false;
 
@@ -29,11 +32,23 @@ float accLatest[3] = {0.0f, 0.0f, 1.0f};
 float gyroLatest[3] = {0.0f, 0.0f, 0.0f};
 float accFiltered[3] = {0.0f, 0.0f, 1.0f};
 float gyroFiltered[3] = {0.0f, 0.0f, 0.0f};
+float gyroZSmoothed = 0.0f;
+float gyroZTurningTrend = 0.0f;
 
 float lowPass(float previous, float current, float dt) {
   const float rc = 1.0f / (2.0f * PI * FILTER_CUTOFF_HZ);
   const float alpha = dt / (rc + dt);
   return previous + alpha * (current - previous);
+}
+
+float filterGyroZPosture(float gyroZ) {
+  if (!postureFilterReady) {
+    gyroZTurningTrend = gyroZ;
+    postureFilterReady = true;
+  }
+
+  gyroZTurningTrend = POSTURE_ALPHA * gyroZTurningTrend + (1.0f - POSTURE_ALPHA) * gyroZ;
+  return gyroZ - gyroZTurningTrend;
 }
 
 void updateFilters(float ax, float ay, float az, float gx, float gy, float gz, float dt) {
@@ -43,7 +58,8 @@ void updateFilters(float ax, float ay, float az, float gx, float gy, float gz, f
     accFiltered[2] = az;
     gyroFiltered[0] = gx;
     gyroFiltered[1] = gy;
-    gyroFiltered[2] = gz;
+    gyroZSmoothed = gz;
+    gyroFiltered[2] = filterGyroZPosture(gyroZSmoothed);
     filterReady = true;
     return;
   }
@@ -53,7 +69,8 @@ void updateFilters(float ax, float ay, float az, float gx, float gy, float gz, f
   accFiltered[2] = lowPass(accFiltered[2], az, dt);
   gyroFiltered[0] = lowPass(gyroFiltered[0], gx, dt);
   gyroFiltered[1] = lowPass(gyroFiltered[1], gy, dt);
-  gyroFiltered[2] = lowPass(gyroFiltered[2], gz, dt);
+  gyroZSmoothed = lowPass(gyroZSmoothed, gz, dt);
+  gyroFiltered[2] = filterGyroZPosture(gyroZSmoothed);
 }
 
 void sendCsv(float timestampS) {
@@ -77,10 +94,6 @@ void sendCsv(float timestampS) {
 void setup() {
   Serial.begin(USB_BAUD_RATE);
   Serial1.begin(UART_BAUD_RATE);
-
-  while (!Serial && millis() < 2500) {
-    ;
-  }
 
   if (!IMU.begin()) {
     Serial.println("ERROR: IMU_INIT_FAILED");
@@ -112,15 +125,6 @@ void loop() {
 
   const uint32_t elapsedUs = nowUs - lastSampleUs;
   if (elapsedUs < PERIOD_US) {
-    if (millis() - lastStatusMs >= 1000) {
-      lastStatusMs = millis();
-      Serial.print("CSV packets sent: ");
-      Serial.print(sequenceNumber);
-      Serial.print(" acc=");
-      Serial.print(haveAccSample ? "ok" : "wait");
-      Serial.print(" gyro=");
-      Serial.println(haveGyroSample ? "ok" : "wait");
-    }
     return;
   }
 
@@ -140,10 +144,4 @@ void loop() {
     elapsedUs / 1000000.0f
   );
   sendCsv(nowUs / 1000000.0f);
-
-  if (millis() - lastStatusMs >= 1000) {
-    lastStatusMs = millis();
-    Serial.print("CSV packets sent: ");
-    Serial.println(sequenceNumber);
-  }
 }

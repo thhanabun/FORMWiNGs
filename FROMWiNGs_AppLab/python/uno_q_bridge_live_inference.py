@@ -16,11 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from arduino.app_utils import App, Bridge
 
-from formsense_pipeline.bluetooth_delivery import BluetoothAlertDelivery
 from formsense_pipeline.filters import Calibration
 from formsense_pipeline.protocol import ProtocolError, parse_imu
+from formsense_pipeline.thermal import ThermalMonitor
 from formsense_pipeline.unoq_model import IMUConfig, RunningFormPredictor
 from uno_q_live_inference import DEFAULT_MODEL, UNOQInferenceSession
+
+
+MCU_BLE_VALUE_LIMIT = 1800
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -41,18 +44,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-s", type=float, default=10.0)
     parser.add_argument("--bad-form-threshold", type=float, default=0.70)
     parser.add_argument("--cooldown-s", type=float, default=20.0)
-    parser.add_argument("--allow-demo-alerts", action="store_true")
     parser.add_argument("--enable-metric-alerts", action="store_true")
-    parser.add_argument("--ble-address")
-    parser.add_argument("--ble-characteristic")
-    parser.add_argument("--ble-scan-timeout-s", type=float, default=3.0)
     parser.add_argument("--worker-batch-size", type=int, default=80)
     parser.add_argument("--worker-batch-wait-s", type=float, default=0.05)
-    parser.add_argument(
-        "--mcu-ble",
-        action="store_true",
-        help="Send compact prediction JSON back to UNO Q MCU method formsense/ble_notify for BLE notify.",
-    )
     parser.add_argument("--max-queue", type=int, default=2000)
     return parser
 
@@ -77,7 +71,7 @@ def _compact_trigger(trigger: object) -> dict[str, object]:
     if not isinstance(trigger, dict):
         return {}
     output: dict[str, object] = {}
-    for key in ("priority", "severity", "code", "message_th"):
+    for key in ("priority", "severity", "code"):
         if key not in trigger:
             continue
         value = trigger[key]
@@ -85,6 +79,16 @@ def _compact_trigger(trigger: object) -> dict[str, object]:
             output[key] = int(value) if key == "priority" else round(float(value), 3)
         else:
             output[key] = str(value)
+    return output
+
+
+def _compact_recommendation(recommendation: object) -> dict[str, object]:
+    if not isinstance(recommendation, dict):
+        return {}
+    output: dict[str, object] = {}
+    for key in ("severity", "code", "device_message"):
+        if key in recommendation:
+            output[key] = str(recommendation[key])
     return output
 
 
@@ -100,24 +104,55 @@ def _model_output_mcu_ble_payload(prediction: dict[str, object]) -> str:
         "class": str(prediction.get("class", "")),
         "probabilities": _rounded_mapping(prediction.get("probabilities"), 4),
         "attention_weights": _rounded_mapping(prediction.get("attention_weights"), 4),
+        "feature_contributions": _rounded_mapping(prediction.get("feature_contributions"), 4),
         "dominant_feature": str(prediction.get("dominant_feature", "")),
         "priority_trigger": _compact_trigger(prediction.get("priority_trigger")),
     }
+    environment = prediction.get("environment")
+    if isinstance(environment, dict) and environment.get("status") != "unavailable":
+        row["environment"] = environment
+    recommendation = _compact_recommendation(prediction.get("recommendation"))
+    if recommendation:
+        row["recommendation"] = recommendation
 
     return json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+
+
+def _drop_optional_ble_text(payload: dict[str, object]) -> dict[str, object]:
+    row = json.loads(json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str))
+    for object_key, text_key in (
+        ("priority_trigger", "message_th"),
+        ("recommendation", "message_th"),
+        ("recommendation", "device_message"),
+        ("environment", "method"),
+    ):
+        target = row.get(object_key)
+        if isinstance(target, dict):
+            target.pop(text_key, None)
+    return row
 
 
 def _send_mcu_payload(payload: dict[str, object]) -> dict[str, object]:
     """Send a JSON dashboard payload to the MCU BLE characteristic."""
 
     compact = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
-    print(f"MCU_BLE_PAYLOAD_JSON={compact}", flush=True)
+    if len(compact) >= MCU_BLE_VALUE_LIMIT:
+        payload = _drop_optional_ble_text(payload)
+        compact = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
+    print(
+        "MCU_BLE_PAYLOAD_SUMMARY="
+        f"type={payload.get('type', '')} bytes={len(compact)}",
+        flush=True,
+    )
+    if len(compact) >= MCU_BLE_VALUE_LIMIT:
+        print(
+            "MCU_BLE_PAYLOAD_TOO_LARGE="
+            f"bytes={len(compact)} limit={MCU_BLE_VALUE_LIMIT - 1}",
+            flush=True,
+        )
+        return {"status": "ERROR", "reason": "payload_too_large", "bytes": len(compact)}
     try:
         with BRIDGE_LOCK:
-            if len(compact) <= 90:
-                Bridge.call("formsense/ble_notify", compact)
-                return {"status": "SENT_TO_MCU", "bytes": len(compact), "chunks": 1}
-
             Bridge.call("formsense/ble_begin", "1")
             chunks = [compact[index : index + 72] for index in range(0, len(compact), 72)]
             for chunk in chunks:
@@ -171,28 +206,16 @@ def main() -> None:
     args = _parser().parse_args()
     if not args.model.exists():
         raise SystemExit(f"Model file not found: {args.model}")
-    if bool(args.ble_address) != bool(args.ble_characteristic):
-        raise SystemExit("Both --ble-address and --ble-characteristic are required for BLE delivery.")
 
     line_queue: queue.Queue[str] = queue.Queue(maxsize=args.max_queue)
     stats = {"received": 0, "dropped_queue": 0, "invalid": 0}
     stop = threading.Event()
+    thermal = ThermalMonitor()
+    thermal_bridge_enabled = True
 
     predictor = RunningFormPredictor(args.model, args.normalizer)
     if not predictor.production_ready:
-        print("WARNING: training normalizer not supplied; model alerts disabled unless --allow-demo-alerts is used.")
-    delivery = BluetoothAlertDelivery(
-        output_dir=args.output_dir,
-        session_id=args.session_id,
-        address=args.ble_address,
-        characteristic=args.ble_characteristic,
-        scan_timeout_s=args.ble_scan_timeout_s,
-    )
-    if delivery.configured:
-        retry = delivery.retry_pending()
-        print(f"BLE delivery configured; retried={retry['sent']} pending={retry['remaining']}")
-    else:
-        print("BLE not configured; alerts will be stored in local outbox.")
+        print("WARNING: training normalizer not supplied; model alerts disabled.")
 
     session = UNOQInferenceSession(
         output_dir=args.output_dir,
@@ -208,9 +231,8 @@ def main() -> None:
         warmup_s=args.warmup_s,
         bad_form_threshold=args.bad_form_threshold,
         cooldown_s=args.cooldown_s,
-        allow_demo_alerts=args.allow_demo_alerts,
+        allow_demo_alerts=False,
         enable_metric_alerts=args.enable_metric_alerts,
-        delivery=delivery,
     )
 
     def ingest_batch(batch: str) -> None:
@@ -280,11 +302,23 @@ def main() -> None:
                     )
                     continue
                 if payload:
+                    payload.update(thermal.output(time.monotonic()))
                     payload["bridge_stats"] = dict(stats)
-                    if args.mcu_ble:
-                        dashboard_payload = json.loads(_model_output_mcu_ble_payload(payload))
-                        payload["mcu_ble"] = _send_mcu_payload(dashboard_payload)
-                    print(f"FULL_PAYLOAD_JSON={json.dumps(payload, ensure_ascii=False, default=str)}", flush=True)
+                    dashboard_payload = json.loads(_model_output_mcu_ble_payload(payload))
+                    payload["mcu_ble"] = _send_mcu_payload(dashboard_payload)
+                    environment = payload.get("environment")
+                    if not isinstance(environment, dict):
+                        environment = {}
+                    print(
+                        "PREDICTION_SUMMARY="
+                        f"window_id={payload.get('window_id', '')} "
+                        f"class={payload.get('class', '')} "
+                        f"dominant={payload.get('dominant_feature', '')} "
+                        f"thermal={environment.get('risk_state', 'na')} "
+                        f"processed={stats.get('processed', 0)} "
+                        f"queue={line_queue.qsize()}",
+                        flush=True,
+                    )
 
             stats["last_worker_batch_size"] = len(lines)
 
@@ -293,6 +327,7 @@ def main() -> None:
     thread.start()
 
     def poll_mcu_imu() -> None:
+        nonlocal thermal_bridge_enabled
         now_s = time.monotonic()
         try:
             with BRIDGE_LOCK:
@@ -305,6 +340,22 @@ def main() -> None:
             return
         if batch:
             ingest_batch(str(batch))
+        if thermal_bridge_enabled and now_s - float(stats.get("last_thermal_poll_s", 0.0)) >= 2.0:
+            stats["last_thermal_poll_s"] = now_s
+            try:
+                with BRIDGE_LOCK:
+                    thermal_payload = Bridge.call("formsense/pop_thermal")
+                if thermal_payload:
+                    reading = thermal.update_from_bridge(str(thermal_payload), now_s)
+                    if reading is not None:
+                        stats["thermal_ok"] = stats.get("thermal_ok", 0) + 1
+            except Exception as error:
+                thermal.mark_invalid(error)
+                stats["thermal_errors"] = stats.get("thermal_errors", 0) + 1
+                if "not available" in str(error):
+                    thermal_bridge_enabled = False
+                if stats["thermal_errors"] <= 3:
+                    print(f"THERMAL_POLL_ERROR {type(error).__name__}: {error}", flush=True)
         if now_s - float(stats.get("last_sensor_status_s", 0.0)) >= 1.0:
             stats["last_sensor_status_s"] = now_s
             result = _log_bridge_status(
@@ -314,10 +365,11 @@ def main() -> None:
                     "queue_size": line_queue.qsize(),
                     "errn": stats.get("processing_errors", 0),
                     "bs": stats.get("last_worker_batch_size", 0),
+                    "th": stats.get("thermal_ok", 0),
                 },
             )
             print(f"BRIDGE_SENSOR_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
-        time.sleep(0.005)
+        time.sleep(0.02)
 
     try:
         print("RouterBridge receiver ready: formsense/imu_batch", flush=True)
