@@ -128,13 +128,13 @@ def _send_mcu_payload(payload: dict[str, object]) -> dict[str, object]:
         return {"status": "ERROR", "reason": type(error).__name__, "message": str(error)}
 
 
-def _send_mcu_status(
+def _bridge_status_payload(
     status: str,
     stats: dict[str, object],
     *,
     extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Send a Bridge-size-safe status payload to the MCU."""
+    """Return a compact status payload for App Lab logs only."""
 
     payload: dict[str, object] = {
         "type": "bridge_status",
@@ -150,7 +150,18 @@ def _send_mcu_status(
                 continue
             text = str(value)
             payload[key] = text[:72] if len(text) > 72 else value
-    return _send_mcu_payload(payload)
+    return payload
+
+
+def _log_bridge_status(
+    status: str,
+    stats: dict[str, object],
+    *,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = _bridge_status_payload(status, stats, extra=extra)
+    print(f"BRIDGE_STATUS_JSON={json.dumps(payload, ensure_ascii=False, default=str)}", flush=True)
+    return {"status": "LOGGED_ONLY", "type": "bridge_status"}
 
 
 BRIDGE_LOCK = threading.Lock()
@@ -258,15 +269,14 @@ def main() -> None:
                     stats["processing_errors"] = stats.get("processing_errors", 0) + 1
                     stats["last_processing_error"] = f"{type(error).__name__}: {error}"
                     print(f"MODEL_PIPELINE_ERROR {stats['last_processing_error']}", flush=True)
-                    if args.mcu_ble:
-                        _send_mcu_status(
-                            "model_error",
-                            stats,
-                            extra={
-                                "queue_size": line_queue.qsize(),
-                                "err": stats["last_processing_error"],
-                            },
-                        )
+                    _log_bridge_status(
+                        "model_error",
+                        stats,
+                        extra={
+                            "queue_size": line_queue.qsize(),
+                            "err": stats["last_processing_error"],
+                        },
+                    )
                     continue
                 if payload:
                     payload["bridge_stats"] = dict(stats)
@@ -294,9 +304,9 @@ def main() -> None:
             return
         if batch:
             ingest_batch(str(batch))
-        if args.mcu_ble and now_s - float(stats.get("last_sensor_status_s", 0.0)) >= 1.0:
+        if now_s - float(stats.get("last_sensor_status_s", 0.0)) >= 1.0:
             stats["last_sensor_status_s"] = now_s
-            result = _send_mcu_status(
+            result = _log_bridge_status(
                 "receiving_imu" if stats["received"] else "waiting_imu",
                 stats,
                 extra={
@@ -305,16 +315,15 @@ def main() -> None:
                     "bs": stats.get("last_worker_batch_size", 0),
                 },
             )
-            print(f"MCU_BLE_SENSOR_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
+            print(f"BRIDGE_SENSOR_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
         time.sleep(0.005)
 
     try:
         print("RouterBridge receiver ready: formsense/imu_batch", flush=True)
         print("Waiting 2s for MCU Bridge methods to register...", flush=True)
         time.sleep(2.0)
-        if args.mcu_ble:
-            result = _send_mcu_status("waiting_imu", stats)
-            print(f"MCU_BLE_STARTUP_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
+        result = _log_bridge_status("waiting_imu", stats)
+        print(f"BRIDGE_STARTUP_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
         App.run(user_loop=poll_mcu_imu)
     finally:
         stop.set()
