@@ -203,6 +203,7 @@ def main() -> None:
             sample_rate_hz=args.sample_rate_hz,
             body_frame_rotation=tuple(args.body_frame_rotation),
             impact_band_hz=(5.0, min(20.0, args.sample_rate_hz * 0.45)),
+            stride_s=2.0,
         ),
         warmup_s=args.warmup_s,
         bad_form_threshold=args.bad_form_threshold,
