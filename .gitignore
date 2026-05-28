@@ -1,0 +1,20 @@
+.tools/
+*.zip
+*.tgz
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime output
+formsense_data/
+*_raw.csv
+*_features.csv
+*_predictions.jsonl
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,5 @@
+-r requirements.txt
+numpy>=1.26,<3
+scipy>=1.11,<2
+ai-edge-litert>=2.1.5,<3
+bleak>=0.22,<3
