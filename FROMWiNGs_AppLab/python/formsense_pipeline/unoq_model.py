@@ -11,6 +11,7 @@ from typing import Mapping, Sequence
 import numpy as np
 from scipy.signal import butter, find_peaks, savgol_filter, sosfiltfilt
 
+from .metric_triggers import MetricTriggerEngine
 from .protocol import FEATURE_KEYS, ImuSample
 
 G_TO_MPS2 = 9.80665
@@ -33,6 +34,25 @@ COACHING_CUES = {
     "trunk_forward_lean_deg": "Forward lean is influential; reset torso alignment from the ankles.",
     "left_right_asymmetry_pct": "Asymmetry proxy is influential; check belt fit and balanced steps.",
     "heel_strike_likelihood": "Foot-strike proxy is influential; confirm this cue with video or foot sensing.",
+}
+
+GOOD_FORM_CUE = "Form metrics are within the rule-based thresholds."
+
+RULE_PRIORITY_SCORES = {
+    1: 4.0,
+    2: 3.0,
+    3: 2.0,
+    4: 1.0,
+}
+
+RULE_METRIC_TO_FEATURE = {
+    "cadence_spm": "cadence_spm",
+    "vertical_oscillation_cm": "vertical_oscillation_cm",
+    "gct_ms": "gct_flight_balance_ms",
+    "peak_vgrf_bw_estimate": "impact_loading_rate_bw_s",
+    "trunk_forward_lean_deg": "trunk_forward_lean_deg",
+    "left_right_asymmetry_pct": "left_right_asymmetry_pct",
+    "footstrike_time_to_peak_ms": "heel_strike_likelihood",
 }
 
 
@@ -456,7 +476,7 @@ class _JsonXGBoostBinaryClassifier:
 
 
 class RunningFormPredictor:
-    """Runs a deployed TFLite or XGBoost model and exposes feature contributions."""
+    """Runs the deployed model contract, backed by TFLite, XGBoost, or rules."""
 
     def __init__(self, model_path: Path, normalizer_path: Path | None = None):
         self.model_path = model_path
@@ -464,11 +484,20 @@ class RunningFormPredictor:
         self.feature_columns = list(FEATURE_KEYS)
         self.class_names = ["Good", "Bad Form"]
         self.normalizer: Mapping[str, object] | None = None
+        self.rule_engine: MetricTriggerEngine | None = None
         metadata_path = model_path.with_name(f"{model_path.stem}_metadata.json")
         if metadata_path.exists():
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.feature_columns = list(metadata.get("feature_columns", self.feature_columns))
             self.class_names = list(metadata.get("class_names", self.class_names))
+        if self.model_kind == "json":
+            model_metadata = json.loads(model_path.read_text(encoding="utf-8"))
+            if model_metadata.get("model_type") == "rulebase":
+                self.model_kind = "rulebase"
+                self.feature_columns = list(model_metadata.get("feature_columns", self.feature_columns))
+                self.class_names = list(model_metadata.get("class_names", self.class_names))
+                self.rule_engine = MetricTriggerEngine()
+                return
         if normalizer_path is not None and not normalizer_path.exists():
             raise FileNotFoundError(f"normalizer file not found: {normalizer_path}")
         if normalizer_path is not None:
@@ -476,6 +505,9 @@ class RunningFormPredictor:
             normalized_columns = self.normalizer.get("feature_columns", self.feature_columns)
             if list(normalized_columns) != list(self.feature_columns):
                 raise ValueError("normalizer feature_columns do not match model feature_columns")
+        if self.model_kind == "json":
+            self.xgboost_model = _JsonXGBoostBinaryClassifier(model_path)
+            return
         if self.model_kind == "tflite":
             Interpreter = _load_interpreter_class()
             self.interpreter = Interpreter(model_path=str(model_path))
@@ -489,16 +521,67 @@ class RunningFormPredictor:
                 raise ValueError("TFLite model must expose features input and feature_attention/probabilities outputs")
             self.runner = self.interpreter.get_signature_runner("serving_default")
             return
-        if self.model_kind == "json":
-            self.xgboost_model = _JsonXGBoostBinaryClassifier(model_path)
-            return
         raise ValueError(f"Unsupported model type: {model_path}")
 
     @property
     def production_ready(self) -> bool:
-        return self.normalizer is not None
+        return self.model_kind == "rulebase" or self.normalizer is not None
 
-    def predict(self, features: Mapping[str, float]) -> dict[str, object]:
+    def _rulebase_prediction(
+        self, features: Mapping[str, float], diagnostics: Mapping[str, float] | None
+    ) -> dict[str, object]:
+        if self.rule_engine is None:
+            raise RuntimeError("rule-based predictor was not initialized")
+
+        triggers = self.rule_engine.evaluate(features, diagnostics or {})
+        contributions = np.zeros(len(self.feature_columns), dtype=np.float64)
+        scores = np.zeros(len(self.feature_columns), dtype=np.float64)
+        for trigger in triggers:
+            feature = RULE_METRIC_TO_FEATURE.get(trigger.metric)
+            if feature not in self.feature_columns:
+                continue
+            index = self.feature_columns.index(feature)
+            score = RULE_PRIORITY_SCORES.get(trigger.priority, 1.0)
+            scores[index] = max(scores[index], score)
+            contributions[index] += score
+
+        if float(np.sum(scores)) > 1e-8:
+            weights = scores / float(np.sum(scores))
+            dominant = self.feature_columns[int(np.argmax(scores))]
+        else:
+            weights = np.full(len(self.feature_columns), 1.0 / len(self.feature_columns), dtype=np.float64)
+            dominant = self.feature_columns[0]
+
+        bad_form = bool(triggers)
+        probabilities = np.asarray([0.0, 1.0] if bad_form else [1.0, 0.0], dtype=np.float32)
+        priority_trigger = triggers[0] if triggers else None
+        if priority_trigger is not None:
+            dominant = RULE_METRIC_TO_FEATURE.get(priority_trigger.metric, dominant)
+            if dominant not in self.feature_columns:
+                dominant = self.feature_columns[int(np.argmax(weights))]
+        predicted_index = 1 if bad_form else 0
+        contribution_map = {
+            key: round(float(value), 6) for key, value in zip(self.feature_columns, contributions)
+        }
+        return {
+            "class": self.class_names[predicted_index],
+            "probabilities": {name: round(float(probabilities[index]), 6) for index, name in enumerate(self.class_names)},
+            "attention_weights": {key: round(float(value), 6) for key, value in zip(self.feature_columns, weights)},
+            "feature_contributions": contribution_map,
+            "dominant_feature": dominant,
+            "dominant_feature_display": FEATURE_DISPLAY_NAMES.get(dominant, dominant),
+            "coaching_cue": priority_trigger.message_th if priority_trigger else GOOD_FORM_CUE,
+            "production_ready": self.production_ready,
+            "model_type": "rulebase",
+            "normalization_status": "NOT_REQUIRED_RULE_BASE",
+        }
+
+    def predict(
+        self, features: Mapping[str, float], diagnostics: Mapping[str, float] | None = None
+    ) -> dict[str, object]:
+        if self.model_kind == "rulebase":
+            return self._rulebase_prediction(features, diagnostics)
+
         raw_values = np.asarray([features[key] for key in self.feature_columns], dtype=np.float32)
         values = raw_values.reshape(1, -1)
         if self.normalizer is not None:

@@ -122,4 +122,5 @@ def encode_feature(window_id: int, end_time_s: float, features: Mapping[str, flo
 
 def encode_alert(severity: str, end_time_s: float, message: str) -> str:
     safe_message = message.replace(",", ";").replace("\n", " ")[:96]
+    safe_message = safe_message.encode("ascii", errors="ignore").decode("ascii").strip() or "Bad form detected"
     return _wrap(f"@ALERT,{severity},{end_time_s:.3f},{safe_message}")

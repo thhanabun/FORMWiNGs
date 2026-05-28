@@ -19,9 +19,9 @@ App Lab files:
 
 ```text
 sketch/sketch.ino  MCU bridge + BLE advertiser
-python/main.py     Linux entrypoint, runs XGBoost model + thermal context
+python/main.py     Linux entrypoint, runs rule-based form classifier + thermal context
 python/            Model pipeline code
-model/             XGBoost model, metadata, normalizer, and TFLite fallback
+model/             Rule-base metadata, legacy XGBoost assets, normalizer, and TFLite fallback
 libraries/         Arduino sketch libraries required by App Lab compile
 ```
 

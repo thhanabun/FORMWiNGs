@@ -61,22 +61,14 @@ if __name__ == "__main__":
         str(
             _first_existing_file(
                 [
-                    APP_ROOT / "running_form_xgboost.json",
-                    APP_ROOT / "model" / "running_form_xgboost.json",
-                    SCRIPT_DIR / "running_form_xgboost.json",
-                    SCRIPT_DIR / "model" / "running_form_xgboost.json",
-                    SCRIPT_DIR.parent / "running_form_xgboost.json",
-                    SCRIPT_DIR.parent / "model" / "running_form_xgboost.json",
-                    WORKING_DIR / "running_form_xgboost.json",
-                    WORKING_DIR / "model" / "running_form_xgboost.json",
-                    APP_ROOT / "running_form_transformer_fp16.tflite",
-                    APP_ROOT / "model" / "running_form_transformer_fp16.tflite",
-                    SCRIPT_DIR / "running_form_transformer_fp16.tflite",
-                    SCRIPT_DIR / "model" / "running_form_transformer_fp16.tflite",
-                    SCRIPT_DIR.parent / "running_form_transformer_fp16.tflite",
-                    SCRIPT_DIR.parent / "model" / "running_form_transformer_fp16.tflite",
-                    WORKING_DIR / "running_form_transformer_fp16.tflite",
-                    WORKING_DIR / "model" / "running_form_transformer_fp16.tflite",
+                    APP_ROOT / "running_form_rulebase.json",
+                    APP_ROOT / "model" / "running_form_rulebase.json",
+                    SCRIPT_DIR / "running_form_rulebase.json",
+                    SCRIPT_DIR / "model" / "running_form_rulebase.json",
+                    SCRIPT_DIR.parent / "running_form_rulebase.json",
+                    SCRIPT_DIR.parent / "model" / "running_form_rulebase.json",
+                    WORKING_DIR / "running_form_rulebase.json",
+                    WORKING_DIR / "model" / "running_form_rulebase.json",
                 ]
             )
         ),

@@ -11,7 +11,7 @@ Nano 33 BLE Sense
 UNO Q MCU sketch
   -> RouterBridge batches
 UNO Q Linux Python app
-  -> feature extraction + XGBoost model
+  -> feature extraction + rule-based form classifier
 UNO Q MCU sketch
   -> BLE notify as FROMWiNGs
 ```
@@ -60,14 +60,14 @@ The batch files only program board firmware.
 - UNO Q sketch receives Nano UART, batches IMU lines, and exposes
   `formsense/pop_imu_batch` to Python.
 - Python polls RouterBridge, parses IMU lines, runs feature extraction and
-  XGBoost inference, and sends prediction payloads to the UNO Q MCU BLE bridge.
+  rule-based inference, and sends prediction payloads to the UNO Q MCU BLE bridge.
 - Feature extraction now resamples dropped/sparse packets back to a uniform 50 Hz
   timeline.
 - A fallback feature window emits predictions even when step detection is not
   confident yet.
 - BLE payloads are chunked with `ble_begin`, `ble_chunk`, and `ble_commit`.
-  The payload includes SHAP-style XGBoost feature contributions and uses an
-  1800-byte MCU BLE buffer.
+  The payload keeps the same prediction schema, including feature contribution
+  fields, and uses an 1800-byte MCU BLE buffer.
 - UNO Q now polls a Modulino Thermo on I2C address `0x44`, exposes
   `formsense/pop_thermal`, and Python adds `environment` plus thermal
   `recommendation` to prediction payloads.

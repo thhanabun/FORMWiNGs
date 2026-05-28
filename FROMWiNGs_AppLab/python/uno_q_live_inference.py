@@ -19,7 +19,7 @@ from formsense_pipeline.metric_triggers import MetricTriggerEngine
 from formsense_pipeline.protocol import FEATURE_KEYS, RAW_COLUMNS, ImuSample, ProtocolError, encode_alert, parse_imu
 from formsense_pipeline.unoq_model import BiomechanicsExtractor, IMUConfig, RunningFormPredictor
 
-DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "model" / "running_form_xgboost.json"
+DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "model" / "running_form_rulebase.json"
 
 
 def _csv_samples(path: Path) -> Iterator[ImuSample]:
@@ -147,8 +147,9 @@ class UNOQInferenceSession:
             return None, None
         features, diagnostics = extraction
         self.window_id += 1
-        prediction = self.predictor.predict(features)
+        prediction = self.predictor.predict(features, diagnostics)
         triggers = self.trigger_engine.evaluate(features, diagnostics)
+        priority_trigger = triggers[0] if triggers else None
         actionable = next((trigger for trigger in triggers if trigger.severity in {"ALERT", "WARN"}), None)
         payload: dict[str, object] = {
             "type": "running_form_prediction",
@@ -157,7 +158,7 @@ class UNOQInferenceSession:
             "features": {key: round(float(features[key]), 5) for key in FEATURE_KEYS},
             "diagnostics": {key: round(float(value), 5) for key, value in diagnostics.items()},
             "metric_triggers": [trigger.as_dict() for trigger in triggers],
-            "priority_trigger": actionable.as_dict() if actionable else None,
+            "priority_trigger": priority_trigger.as_dict() if priority_trigger else None,
             **prediction,
         }
         probabilities = prediction["probabilities"]
@@ -174,7 +175,7 @@ class UNOQInferenceSession:
                 "gct_ms": round(diagnostics["gct_ms"], 5),
                 "peak_vgrf_bw_estimate": round(diagnostics["peak_vgrf_bw_estimate"], 5),
                 "footstrike_time_to_peak_ms": round(diagnostics["footstrike_time_to_peak_ms"], 5),
-                "priority_trigger": actionable.code if actionable else "",
+                "priority_trigger": priority_trigger.code if priority_trigger else "",
             }
         )
         alert: str | None = None
