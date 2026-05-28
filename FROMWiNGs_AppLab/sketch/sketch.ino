@@ -22,11 +22,14 @@ const uint32_t STATUS_INTERVAL_MS = 1000;
 const uint32_t BRIDGE_FLUSH_INTERVAL_MS = 120;
 const uint32_t THERMAL_INTERVAL_MS = 2000;
 const uint32_t THERMAL_CONVERSION_MS = 40;
+const uint32_t BLE_NOTIFY_INTERVAL_MS = 40;
 const uint8_t THERMAL_I2C_ADDRESS = 0x44;
 const size_t RX_BUFFER_SIZE = 128;
 const size_t BRIDGE_BATCH_SIZE = 512;
 const size_t BRIDGE_QUEUE_SIZE = 32;
-const size_t BLE_VALUE_SIZE = 1800;
+const size_t BLE_CHARACTERISTIC_SIZE = 64;
+const size_t BLE_VALUE_SIZE = BLE_CHARACTERISTIC_SIZE + 1;
+const size_t BLE_NOTIFY_QUEUE_SIZE = 128;
 
 const char *SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214";
 const char *CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214";
@@ -35,12 +38,13 @@ BLEService formSenseService(SERVICE_UUID);
 BLEStringCharacteristic formSenseCharacteristic(
   CHARACTERISTIC_UUID,
   BLERead | BLENotify,
-  BLE_VALUE_SIZE
+  BLE_CHARACTERISTIC_SIZE
 );
 
 char rxBuffer[RX_BUFFER_SIZE];
 char bridgeBatch[BRIDGE_BATCH_SIZE];
 char pendingBridgeBatches[BRIDGE_QUEUE_SIZE][BRIDGE_BATCH_SIZE];
+char pendingBlePackets[BLE_NOTIFY_QUEUE_SIZE][BLE_VALUE_SIZE];
 char latestSensorLine[RX_BUFFER_SIZE] = "";
 char latestThermalLine[64] = "";
 char pendingBle[BLE_VALUE_SIZE] = "";
@@ -51,8 +55,10 @@ size_t pendingBleIndex = 0;
 uint8_t bridgeQueueHead = 0;
 uint8_t bridgeQueueTail = 0;
 uint8_t bridgeQueueCount = 0;
+uint8_t bleQueueHead = 0;
+uint8_t bleQueueTail = 0;
+uint8_t bleQueueCount = 0;
 
-volatile bool hasPendingBle = false;
 bool pendingBleChunkOk = true;
 bool bleClientConnected = false;
 bool lastBleClientConnected = false;
@@ -62,8 +68,10 @@ uint32_t bridgePopCalls = 0;
 uint32_t bridgePopHits = 0;
 uint32_t droppedFrames = 0;
 uint32_t droppedBridge = 0;
+uint32_t droppedBle = 0;
 uint32_t bleUpdates = 0;
 uint32_t lastBleUpdates = 0;
+uint32_t lastBleNotifyMs = 0;
 uint32_t lastPacketMs = 0;
 uint32_t lastFlushMs = 0;
 uint32_t lastStatusMs = 0;
@@ -89,7 +97,6 @@ void clearRuntimeQueues() {
   pendingBle[0] = '\0';
   pendingBleIndex = 0;
   pendingBleChunkOk = true;
-  hasPendingBle = false;
   lastPacketMs = millis();
 }
 
@@ -97,7 +104,9 @@ void clearPendingBlePayload() {
   pendingBle[0] = '\0';
   pendingBleIndex = 0;
   pendingBleChunkOk = true;
-  hasPendingBle = false;
+  bleQueueHead = 0;
+  bleQueueTail = 0;
+  bleQueueCount = 0;
 }
 
 String bleConnectedPayload() {
@@ -109,7 +118,6 @@ bool beginBlePayload(String payload) {
   pendingBle[0] = '\0';
   pendingBleIndex = 0;
   pendingBleChunkOk = true;
-  hasPendingBle = false;
   return true;
 }
 
@@ -137,7 +145,22 @@ bool commitBlePayload(String payload) {
     pendingBleChunkOk = true;
     return false;
   }
-  hasPendingBle = true;
+
+  if (bleQueueCount >= BLE_NOTIFY_QUEUE_SIZE) {
+    droppedBle++;
+    pendingBle[0] = '\0';
+    pendingBleIndex = 0;
+    pendingBleChunkOk = true;
+    return false;
+  }
+
+  strncpy(pendingBlePackets[bleQueueTail], pendingBle, BLE_VALUE_SIZE - 1);
+  pendingBlePackets[bleQueueTail][BLE_VALUE_SIZE - 1] = '\0';
+  bleQueueTail = (bleQueueTail + 1) % BLE_NOTIFY_QUEUE_SIZE;
+  bleQueueCount++;
+  pendingBle[0] = '\0';
+  pendingBleIndex = 0;
+  pendingBleChunkOk = true;
   return true;
 }
 
@@ -334,13 +357,20 @@ void serviceThermal() {
 }
 
 void serviceBle() {
-  if (!bleClientConnected || !hasPendingBle) {
+  if (!bleClientConnected || bleQueueCount == 0) {
     return;
   }
 
-  strncpy(latestBle, pendingBle, BLE_VALUE_SIZE - 1);
+  if (millis() - lastBleNotifyMs < BLE_NOTIFY_INTERVAL_MS) {
+    return;
+  }
+  lastBleNotifyMs = millis();
+
+  strncpy(latestBle, pendingBlePackets[bleQueueHead], BLE_VALUE_SIZE - 1);
   latestBle[BLE_VALUE_SIZE - 1] = '\0';
-  hasPendingBle = false;
+  pendingBlePackets[bleQueueHead][0] = '\0';
+  bleQueueHead = (bleQueueHead + 1) % BLE_NOTIFY_QUEUE_SIZE;
+  bleQueueCount--;
   formSenseCharacteristic.writeValue(latestBle);
   bleUpdates++;
 }
@@ -390,10 +420,14 @@ void printStatus() {
   Monitor.print(bleUpdates);
   Monitor.print(" ble_hz=");
   Monitor.print(bleDelta);
+  Monitor.print(" ble_q=");
+  Monitor.print(bleQueueCount);
   Monitor.print(" dropped_frames=");
   Monitor.print(droppedFrames);
   Monitor.print(" dropped_bridge=");
   Monitor.print(droppedBridge);
+  Monitor.print(" dropped_ble=");
+  Monitor.print(droppedBle);
   if (latestSensorLine[0] != '\0') {
     Monitor.print(" latest_sensor=");
     Monitor.print(latestSensorLine);

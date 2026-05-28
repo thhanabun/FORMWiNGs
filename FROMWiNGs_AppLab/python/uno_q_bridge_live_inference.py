@@ -7,7 +7,6 @@ import argparse
 import json
 import queue
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -25,8 +24,12 @@ from formsense_pipeline.unoq_model import IMUConfig, RunningFormPredictor
 from uno_q_live_inference import DEFAULT_MODEL, UNOQInferenceSession
 
 
-MCU_BLE_VALUE_LIMIT = 1800
-
+MCU_BLE_FRAME_LIMIT = 64
+MCU_BLE_CHUNK_DATA_SIZE = 64
+MCU_BLE_NOTIFY_INTERVAL_S = 0.04
+MCU_BLE_PAYLOAD_GAP_S = 0.05
+BLE_STABLE_BEFORE_SEND_S = 3.0
+MIN_PREDICTION_SEND_INTERVAL_S = 0.75
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UNO Q RouterBridge inference from MCU UART batches.")
@@ -50,123 +53,162 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-batch-size", type=int, default=80)
     parser.add_argument("--worker-batch-wait-s", type=float, default=0.05)
     parser.add_argument("--max-queue", type=int, default=30000)
-    parser.add_argument(
-        "--ble-idle-shutdown-min",
-        type=float,
-        default=30.0,
-        help="Power off UNO Q Linux after this many continuous minutes without BLE; set 0 to disable.",
-    )
     return parser
 
 
-def _round_number(value: object, digits: int = 3) -> float:
-    return round(float(value), digits)
+DOMINANT_FEATURE_CODES = {
+    "cadence_spm": "c",
+    "vertical_oscillation_cm": "vo",
+    "gct_flight_balance_ms": "gb",
+    "impact_loading_rate_bw_s": "lr",
+    "trunk_forward_lean_deg": "ln",
+    "left_right_asymmetry_pct": "la",
+    "heel_strike_likelihood": "hs",
+}
+
+RISK_STATE_CODES = {
+    "Normal": "n",
+    "Caution": "c",
+    "Warning": "w",
+    "Danger": "d",
+}
+
+ENV_STATUS_CODES = {
+    "ok": "ok",
+    "unavailable": "u",
+    "stale": "s",
+}
 
 
-def _rounded_mapping(values: object, digits: int = 3) -> dict[str, float]:
-    if not isinstance(values, dict):
-        return {}
-    output: dict[str, float] = {}
-    for key, value in values.items():
-        try:
-            output[str(key)] = _round_number(value, digits)
-        except (TypeError, ValueError):
-            continue
-    return output
+def _compact_number(value: object, digits: int) -> float | int | None:
+    try:
+        rounded = round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+    if rounded == int(rounded):
+        return int(rounded)
+    return rounded
 
 
-def _compact_trigger(trigger: object) -> dict[str, object]:
-    if not isinstance(trigger, dict):
-        return {}
-    output: dict[str, object] = {}
-    for key in ("priority", "severity", "code"):
-        if key not in trigger:
-            continue
-        value = trigger[key]
-        if isinstance(value, (int, float)):
-            output[key] = int(value) if key == "priority" else round(float(value), 3)
-        else:
-            output[key] = str(value)
-    return output
+def _put_number(output: dict[str, object], key: str, value: object, digits: int) -> None:
+    compact = _compact_number(value, digits)
+    if compact is not None:
+        output[key] = compact
 
 
-def _compact_recommendation(recommendation: object) -> dict[str, object]:
-    if not isinstance(recommendation, dict):
-        return {}
-    output: dict[str, object] = {}
-    for key in ("severity", "code", "device_message"):
-        if key in recommendation:
-            output[key] = str(recommendation[key])
-    return output
+def _compact_live_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Return the smallest BLE live packet; local logs still keep the full schema."""
 
+    features = payload.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    diagnostics = payload.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        diagnostics = {}
+    probabilities = payload.get("probabilities")
+    if not isinstance(probabilities, dict):
+        probabilities = {}
 
-def _model_output_mcu_ble_payload(prediction: dict[str, object]) -> str:
-    """Return LightBlue-friendly model output JSON for MCU BLE notifications."""
-
-    row: dict[str, object] = {
-        "type": "running_form_prediction",
-        "window_id": int(prediction.get("window_id", 0)),
-        "timestamp_s": _round_number(prediction.get("timestamp_s", 0.0), 4),
-        "features": _rounded_mapping(prediction.get("features"), 2),
-        "diagnostics": _rounded_mapping(prediction.get("diagnostics"), 2),
-        "class": str(prediction.get("class", "")),
-        "probabilities": _rounded_mapping(prediction.get("probabilities"), 4),
-        "attention_weights": _rounded_mapping(prediction.get("attention_weights"), 4),
-        "feature_contributions": _rounded_mapping(prediction.get("feature_contributions"), 4),
-        "dominant_feature": str(prediction.get("dominant_feature", "")),
-        "priority_trigger": _compact_trigger(prediction.get("priority_trigger")),
+    output: dict[str, object] = {
+        "t": "p",
+        "f": 0 if payload.get("class") == "Good" else 1,
     }
-    environment = prediction.get("environment")
+    if payload.get("window_id") is not None:
+        output["w"] = payload.get("window_id")
+
+    _put_number(output, "ts", payload.get("timestamp_s"), 2)
+    _put_number(output, "c", features.get("cadence_spm"), 1)
+    _put_number(output, "vo", features.get("vertical_oscillation_cm"), 2)
+    _put_number(output, "gb", features.get("gct_flight_balance_ms"), 1)
+    _put_number(output, "lr", features.get("impact_loading_rate_bw_s"), 2)
+    _put_number(output, "ln", features.get("trunk_forward_lean_deg"), 1)
+    _put_number(output, "la", features.get("left_right_asymmetry_pct"), 1)
+    _put_number(output, "hs", features.get("heel_strike_likelihood"), 2)
+    _put_number(output, "g", diagnostics.get("gct_ms"), 1)
+    _put_number(output, "ft", diagnostics.get("flight_time_ms"), 1)
+    _put_number(output, "pf", diagnostics.get("peak_vgrf_bw_estimate"), 2)
+    _put_number(output, "tp", diagnostics.get("footstrike_time_to_peak_ms"), 1)
+    _put_number(output, "fb", diagnostics.get("fallback_window"), 0)
+    _put_number(output, "ds", diagnostics.get("detected_step_events"), 0)
+    _put_number(output, "pg", probabilities.get("Good"), 3)
+    _put_number(output, "pb", probabilities.get("Bad Form"), 3)
+
+    dominant_feature = payload.get("dominant_feature")
+    if dominant_feature in DOMINANT_FEATURE_CODES:
+        output["df"] = DOMINANT_FEATURE_CODES[dominant_feature]
+
+    priority_trigger = payload.get("priority_trigger")
+    if isinstance(priority_trigger, dict):
+        severity = priority_trigger.get("severity")
+        code = priority_trigger.get("code")
+        if severity:
+            output["ps"] = str(severity).lower()
+        if code:
+            output["pc"] = code
+        _put_number(output, "pv", priority_trigger.get("value"), 2)
+        _put_number(output, "px", priority_trigger.get("threshold"), 2)
+
+    environment = payload.get("environment")
     if isinstance(environment, dict) and environment.get("status") != "unavailable":
-        row["environment"] = environment
-    recommendation = _compact_recommendation(prediction.get("recommendation"))
-    if recommendation:
-        row["recommendation"] = recommendation
+        output["st"] = ENV_STATUS_CODES.get(str(environment.get("status")), str(environment.get("status", ""))[:1])
+        _put_number(output, "et", environment.get("temperature_c"), 1)
+        _put_number(output, "eh", environment.get("humidity_pct"), 0)
+        _put_number(output, "ei", environment.get("heat_index_c"), 1)
+        risk_state = environment.get("risk_state")
+        if risk_state:
+            output["er"] = RISK_STATE_CODES.get(str(risk_state), str(risk_state)[:1].lower())
+        _put_number(output, "es", environment.get("risk_score"), 0)
+        _put_number(output, "ea", environment.get("age_s"), 1)
 
-    return json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+    recommendation = payload.get("recommendation")
+    if isinstance(recommendation, dict):
+        severity = recommendation.get("severity")
+        code = recommendation.get("code")
+        if severity:
+            output["rs"] = str(severity).lower()
+        if code:
+            output["rc"] = code
 
-
-def _drop_optional_ble_text(payload: dict[str, object]) -> dict[str, object]:
-    row = json.loads(json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str))
-    for object_key, text_key in (
-        ("priority_trigger", "message_th"),
-        ("recommendation", "message_th"),
-        ("recommendation", "device_message"),
-        ("environment", "method"),
-    ):
-        target = row.get(object_key)
-        if isinstance(target, dict):
-            target.pop(text_key, None)
-    return row
+    return output
 
 
 def _send_mcu_payload(payload: dict[str, object]) -> dict[str, object]:
-    """Send a JSON dashboard payload to the MCU BLE characteristic."""
+    """Send the full dashboard payload as small BLE notification chunks."""
 
+    payload = _compact_live_payload(payload)
     compact = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
-    if len(compact) >= MCU_BLE_VALUE_LIMIT:
-        payload = _drop_optional_ble_text(payload)
-        compact = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
+    chunks = [
+        compact[index : index + MCU_BLE_CHUNK_DATA_SIZE]
+        for index in range(0, len(compact), MCU_BLE_CHUNK_DATA_SIZE)
+    ]
     print(
         "MCU_BLE_PAYLOAD_SUMMARY="
-        f"type={payload.get('type', '')} bytes={len(compact)}",
+        f"type={payload.get('type', '')} bytes={len(compact)} chunks={len(chunks)}",
         flush=True,
     )
-    if len(compact) >= MCU_BLE_VALUE_LIMIT:
-        print(
-            "MCU_BLE_PAYLOAD_TOO_LARGE="
-            f"bytes={len(compact)} limit={MCU_BLE_VALUE_LIMIT - 1}",
-            flush=True,
-        )
-        return {"status": "ERROR", "reason": "payload_too_large", "bytes": len(compact)}
     try:
         with BRIDGE_LOCK:
-            Bridge.call("formsense/ble_begin", "1")
-            chunks = [compact[index : index + 72] for index in range(0, len(compact), 72)]
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks):
+                if len(chunk) > MCU_BLE_FRAME_LIMIT:
+                    return {
+                        "status": "ERROR",
+                        "reason": "ble_frame_too_large",
+                        "frame_bytes": len(chunk),
+                    }
+                Bridge.call("formsense/ble_begin", "1")
                 Bridge.call("formsense/ble_chunk", chunk)
-            Bridge.call("formsense/ble_commit", "1")
-        return {"status": "SENT_TO_MCU", "bytes": len(compact), "chunks": len(chunks)}
+                committed = Bridge.call("formsense/ble_commit", "1")
+                if not committed:
+                    return {
+                        "status": "ERROR",
+                        "reason": "mcu_ble_queue_full",
+                        "bytes": len(compact),
+                        "chunks": len(chunks),
+                        "failed_index": index,
+                    }
+                time.sleep(0.005)
+            time.sleep((len(chunks) * MCU_BLE_NOTIFY_INTERVAL_S) + MCU_BLE_PAYLOAD_GAP_S)
+        return {"status": "SENT_TO_MCU_TEXT", "bytes": len(compact), "chunks": len(chunks)}
     except Exception as error:
         return {"status": "ERROR", "reason": type(error).__name__, "message": str(error)}
 
@@ -210,6 +252,42 @@ def _log_bridge_status(
 BRIDGE_LOCK = threading.Lock()
 
 
+def _parsed_sample_ok(sample: object, stats: dict[str, object]) -> bool:
+    try:
+        seq = int(getattr(sample, "seq"))
+        timestamp_s = float(getattr(sample, "timestamp_s"))
+        acc_values = [
+            float(getattr(sample, "acc_x_g")),
+            float(getattr(sample, "acc_y_g")),
+            float(getattr(sample, "acc_z_g")),
+        ]
+        gyro_values = [
+            float(getattr(sample, "gyro_x_dps")),
+            float(getattr(sample, "gyro_y_dps")),
+            float(getattr(sample, "gyro_z_dps")),
+        ]
+    except (TypeError, ValueError):
+        stats["invalid_range"] = stats.get("invalid_range", 0) + 1
+        return False
+
+    if seq < 0 or seq > 10_000_000:
+        stats["invalid_range"] = stats.get("invalid_range", 0) + 1
+        return False
+    if timestamp_s < 0.0 or timestamp_s > 1_000_000.0:
+        stats["invalid_range"] = stats.get("invalid_range", 0) + 1
+        return False
+    if any(abs(value) > 16.0 for value in acc_values):
+        stats["invalid_range"] = stats.get("invalid_range", 0) + 1
+        return False
+    if any(abs(value) > 3000.0 for value in gyro_values):
+        stats["invalid_range"] = stats.get("invalid_range", 0) + 1
+        return False
+
+    stats["last_valid_seq"] = seq
+    stats["last_valid_timestamp_s"] = timestamp_s
+    return True
+
+
 def main() -> None:
     args = _parser().parse_args()
     if not args.model.exists():
@@ -217,8 +295,10 @@ def main() -> None:
 
     line_queue: queue.Queue[str] = queue.Queue(maxsize=args.max_queue)
     stats = {"received": 0, "dropped_queue": 0, "invalid": 0, "ble_connected": False}
+    latest_payload_lock = threading.Lock()
+    latest_payload: dict[str, object] | None = None
+    latest_payload_event = threading.Event()
     stop = threading.Event()
-    poweroff_requested = {"enabled": False, "reason": ""}
     thermal = ThermalMonitor()
     thermal_bridge_enabled = True
 
@@ -281,6 +361,7 @@ def main() -> None:
             )
 
     def worker() -> None:
+        nonlocal latest_payload
         print(f"Model: {args.model}", flush=True)
         print(f"Saving: {session.raw_path}, {session.features_path}, {session.predictions_path}", flush=True)
         while not stop.is_set():
@@ -311,6 +392,15 @@ def main() -> None:
                     if stats["invalid"] <= 10 or stats["invalid"] % 100 == 0:
                         print(f"dropped invalid bridge packet: {error}", flush=True)
                     continue
+                if not _parsed_sample_ok(sample, stats):
+                    stats["invalid"] += 1
+                    if stats["invalid"] <= 10 or stats["invalid"] % 100 == 0:
+                        print(
+                            "dropped invalid bridge packet: unreasonable IMU sample "
+                            f"range={stats.get('invalid_range', 0)}",
+                            flush=True,
+                        )
+                    continue
                 try:
                     payload, _alert = session.ingest(sample)
                     stats["processed"] = stats.get("processed", 0) + 1
@@ -332,8 +422,9 @@ def main() -> None:
                         continue
                     payload.update(thermal.output(time.monotonic()))
                     payload["bridge_stats"] = dict(stats)
-                    dashboard_payload = json.loads(_model_output_mcu_ble_payload(payload))
-                    payload["mcu_ble"] = _send_mcu_payload(dashboard_payload)
+                    with latest_payload_lock:
+                        latest_payload = dict(payload)
+                    latest_payload_event.set()
                     environment = payload.get("environment")
                     if not isinstance(environment, dict):
                         environment = {}
@@ -350,9 +441,54 @@ def main() -> None:
 
             stats["last_worker_batch_size"] = len(lines)
 
+    def ble_sender() -> None:
+        nonlocal latest_payload
+        last_send_s = 0.0
+        while not stop.is_set():
+            latest_payload_event.wait(timeout=0.2)
+            if stop.is_set():
+                return
+            if not latest_payload_event.is_set():
+                continue
+            now_s = time.monotonic()
+            connected_since = stats.get("ble_connected_since_s")
+            if (
+                not stats.get("ble_connected", False)
+                or connected_since is None
+                or now_s - float(connected_since) < BLE_STABLE_BEFORE_SEND_S
+            ):
+                time.sleep(0.1)
+                continue
+            if now_s - last_send_s < MIN_PREDICTION_SEND_INTERVAL_S:
+                time.sleep(0.1)
+                continue
+            with latest_payload_lock:
+                payload_to_send = latest_payload
+                latest_payload = None
+                latest_payload_event.clear()
+            if payload_to_send is None:
+                continue
+            payload_to_send["bridge_stats"] = {
+                "rx": stats.get("received", 0),
+                "ok": stats.get("processed", 0),
+                "bad": stats.get("invalid", 0),
+                "q": line_queue.qsize(),
+            }
+            result = _send_mcu_payload(payload_to_send)
+            last_send_s = time.monotonic()
+            stats["last_mcu_ble"] = result
+            print(
+                "BLE_SEND_RESULT="
+                f"status={result.get('status')} chunks={result.get('chunks', 0)} "
+                f"bytes={result.get('bytes', 0)} queue={line_queue.qsize()}",
+                flush=True,
+            )
+
     Bridge.provide("formsense/imu_batch", ingest_batch)
     thread = threading.Thread(target=worker, daemon=True)
+    sender_thread = threading.Thread(target=ble_sender, daemon=True)
     thread.start()
+    sender_thread.start()
 
     def poll_mcu_imu() -> None:
         nonlocal thermal_bridge_enabled
@@ -372,32 +508,17 @@ def main() -> None:
         if previous_ble_connected != ble_connected:
             if ble_connected:
                 stats["ble_connects"] = stats.get("ble_connects", 0) + 1
+                stats["ble_connected_since_s"] = now_s
                 stats["ble_disconnected_since_s"] = None
                 print(f"BLE_CONNECTED: processing cached queue={line_queue.qsize()}", flush=True)
             else:
                 stats["ble_disconnects"] = stats.get("ble_disconnects", 0) + 1
+                stats["ble_connected_since_s"] = None
                 stats["ble_disconnected_since_s"] = now_s
+                latest_payload_event.clear()
                 print("BLE_DISCONNECTED: caching local sensor data", flush=True)
-        elif not ble_connected and stats.get("ble_disconnected_since_s") is None:
-            stats["ble_disconnected_since_s"] = now_s
-
-        shutdown_after_s = max(0.0, float(args.ble_idle_shutdown_min) * 60.0)
-        disconnected_since = stats.get("ble_disconnected_since_s")
-        if not ble_connected and shutdown_after_s > 0.0 and disconnected_since is not None:
-            idle_s = now_s - float(disconnected_since)
-            stats["ble_idle_s"] = round(idle_s, 1)
-            if idle_s >= shutdown_after_s:
-                reason = f"no_ble_for_{args.ble_idle_shutdown_min:g}_min"
-                poweroff_requested["enabled"] = True
-                poweroff_requested["reason"] = reason
-                print(
-                    "BLE_IDLE_SHUTDOWN "
-                    f"reason={reason} cached={stats.get('cached_local', 0)} "
-                    f"queue={line_queue.qsize()}",
-                    flush=True,
-                )
-                stop.set()
-                raise SystemExit(0)
+        elif ble_connected and stats.get("ble_connected_since_s") is None:
+            stats["ble_connected_since_s"] = now_s
 
         try:
             with BRIDGE_LOCK:
@@ -440,7 +561,6 @@ def main() -> None:
                     "bs": stats.get("last_worker_batch_size", 0),
                     "th": stats.get("thermal_ok", 0),
                     "cache": stats.get("cached_local", 0),
-                    "idle_s": stats.get("ble_idle_s", 0),
                 },
             )
             print(f"BRIDGE_SENSOR_STATUS={json.dumps(result, ensure_ascii=False)}", flush=True)
@@ -455,7 +575,9 @@ def main() -> None:
         App.run(user_loop=poll_mcu_imu)
     finally:
         stop.set()
+        latest_payload_event.set()
         thread.join(timeout=1.0)
+        sender_thread.join(timeout=1.0)
         local_cache_handle.close()
         session.close()
         print(
@@ -463,12 +585,6 @@ def main() -> None:
             f"{session.predictions_path}, {local_cache_path}",
             flush=True,
         )
-        if poweroff_requested["enabled"]:
-            print(f"POWER_OFF_REQUEST reason={poweroff_requested['reason']} command=sudo halt", flush=True)
-            try:
-                subprocess.run(["sudo", "halt"], check=False, timeout=15)
-            except Exception as error:
-                print(f"POWER_OFF_ERROR {type(error).__name__}: {error}", flush=True)
 
 
 if __name__ == "__main__":
